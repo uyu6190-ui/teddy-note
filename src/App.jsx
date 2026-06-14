@@ -1,10 +1,7 @@
 import React, { useState, useRef, useEffect } from "react";
-import { watchAuth, loginGoogle, logout, jpAuthError } from "./auth";
-import { loadUserData, saveUserData } from "./db";
-import { fileToSrc } from "./storage";
 
 /* ============================================================
-   teddy note 🐶 — カードノートアプリ (Artifactプレビュー版)
+   onote 🐶 — カードノートアプリ (Artifactプレビュー版)
    - 無限キャンバス × カード(テキスト/画像/PDF)
    - カード内の文字・画像も「子カード」: 移動/拡縮/接続/複製/
      削除/外に出して独立カード化 がすべて可能
@@ -37,6 +34,29 @@ const CARD_DEFAULT = "#ffffff";
 const PANEL = "#ffffff";
 const LIGHT_TXT = "#d9dde2";      // 暗いキャンバス上の文字
 const SERIF = "Georgia, 'Times New Roman', 'Hiragino Mincho ProN', serif";
+
+// テキストカード用フォント
+const FONT_OPTIONS = [
+  { id: "sans",   label: "ゴシック", css: "'Hiragino Sans','Noto Sans JP',sans-serif" },
+  { id: "mincho", label: "明朝",     css: "'Hiragino Mincho ProN','Yu Mincho',serif" },
+  { id: "round",  label: "丸文字",   css: "'Hiragino Maru Gothic ProN','Yu Gothic',sans-serif" },
+  { id: "serif",  label: "セリフ",   css: "Georgia,'Times New Roman',serif" },
+];
+const fontCss = (id) => (FONT_OPTIONS.find((f) => f.id === id) || FONT_OPTIONS[0]).css;
+
+// リッチテキストの描画(部分ごとに色・フォントが違う場合)
+function RichText({ runs, text, baseColor, baseFont }) {
+  if (runs && runs.length) {
+    return runs.map((r, i) => (
+      <span key={i} style={{
+        color: r.color || baseColor, fontFamily: r.font ? fontCss(r.font) : undefined,
+      }}>{r.text}</span>
+    ));
+  }
+  return text;
+}
+// runs ⇄ プレーン文字列
+const runsToText = (runs) => (runs || []).map((r) => r.text).join("");
 
 const isDarkColor = (hex) => {
   if (!hex || hex === "transparent" || hex[0] !== "#") return false;
@@ -154,6 +174,46 @@ const migrateCard = (c) => {
    カード描画(キャンバスのサムネ / 閲覧 / 編集の共通ステージ)
    子カードは親の800x600座標系の中で描画される
    ============================================================ */
+// 鉛筆風のざらざらフィルタ(SVG)。idはユニークに
+function PencilDefs({ id }) {
+  return (
+    <defs>
+      <filter id={id} x="-20%" y="-20%" width="140%" height="140%">
+        <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" seed="4" result="noise" />
+        <feDisplacementMap in="SourceGraphic" in2="noise" scale="2.2" xChannelSelector="R" yChannelSelector="G" />
+      </filter>
+    </defs>
+  );
+}
+// 1本のストローク描画(鉛筆=ざらつき+半透明の二重描き)
+function Stroke({ s }) {
+  const pts = s.points.map((p) => p.join(",")).join(" ");
+  const kind = s.kind || (s.pencil ? "pencil" : "pen"); // 旧データ互換
+  if (kind === "pencil") {
+    const fid = "pcl_" + s.id;
+    return (
+      <g>
+        <PencilDefs id={fid} />
+        <polyline points={pts} fill="none" stroke={s.color} strokeWidth={s.width}
+          strokeLinecap="round" strokeLinejoin="round" opacity="0.55" filter={`url(#${fid})`} />
+        <polyline points={pts} fill="none" stroke={s.color} strokeWidth={s.width * 0.6}
+          strokeLinecap="round" strokeLinejoin="round" opacity="0.4" filter={`url(#${fid})`} />
+      </g>
+    );
+  }
+  if (kind === "marker") {
+    // マーカー: 太め・30%不透明・四角い筆先で重ね塗りすると濃くなる
+    return (
+      <polyline points={pts} fill="none" stroke={s.color} strokeWidth={s.width}
+        strokeLinecap="butt" strokeLinejoin="round" opacity="0.3" />
+    );
+  }
+  return (
+    <polyline points={pts} fill="none" stroke={s.color} strokeWidth={s.width}
+      strokeLinecap="round" strokeLinejoin="round" />
+  );
+}
+
 function ChildView({ ch }) {
   return (
     <div style={{
@@ -165,19 +225,18 @@ function ChildView({ ch }) {
         <img src={ch.src} alt="" draggable={false}
           style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
       )}
-      {typeof ch.text === "string" && ch.text !== "" && (
+      {(typeof ch.text === "string" && ch.text !== "" || (ch.runs && ch.runs.length)) && (
         <div style={{
           fontSize: ch.fontSize || 44, color: ch.textColor || INK, fontWeight: 700,
-          whiteSpace: "pre-wrap", lineHeight: 1.25, padding: 6,
-        }}>{ch.text}</div>
+          whiteSpace: "pre-wrap", lineHeight: 1.3, padding: 6,
+          fontFamily: fontCss(ch.font),
+          writingMode: ch.vertical ? "vertical-rl" : "horizontal-tb",
+        }}><RichText runs={ch.runs} text={ch.text} baseColor={ch.textColor || INK} baseFont={ch.font} /></div>
       )}
       {ch.strokes.length > 0 && (
         <svg viewBox={`0 0 ${STAGE_W} ${STAGE_H}`} width="100%" height="100%" preserveAspectRatio="none"
           style={{ position: "absolute", inset: 0 }}>
-          {ch.strokes.map((s) => (
-            <polyline key={s.id} points={s.points.map((p) => p.join(",")).join(" ")}
-              fill="none" stroke={s.color} strokeWidth={s.width} strokeLinecap="round" strokeLinejoin="round" />
-          ))}
+          {ch.strokes.map((s) => <Stroke key={s.id} s={s} />)}
         </svg>
       )}
     </div>
@@ -186,11 +245,14 @@ function ChildView({ ch }) {
 
 function CardStage({ card, subCards = [], w, h, hint = false }) {
   const sx = w / STAGE_W, sy = h / STAGE_H;
+  const hasColor = card.color && card.color !== "transparent";
   const bg =
     card.type === "text" ? (card.color === "transparent" ? "transparent" : (card.color || CARD_DEFAULT)) :
-    card.type === "web" ? "#eef6ee" : "#ffffff";
+    card.type === "web" ? "#eef6ee" :
+    hasColor ? card.color : "#ffffff"; // 画像/PDFは色を縁(下地)として表示
   const dark = card.type === "text" && isDarkColor(card.color);
   const empty = !card.text && card.strokes.length === 0 && subCards.length === 0;
+  const frame = hasColor && (card.type === "image" || card.type === "pdf"); // 縁取り表示
   return (
     <div style={{ width: w, height: h, overflow: "hidden", position: "relative", background: bg }}>
       <div style={{
@@ -207,7 +269,7 @@ function CardStage({ card, subCards = [], w, h, hint = false }) {
         )}
         {card.type === "image" && card.src && (
           <img src={card.src} alt="" draggable={false}
-            style={{ width: STAGE_W, height: STAGE_H, objectFit: "cover", position: "absolute", inset: 0 }} />
+            style={{ position: "absolute", inset: frame ? 18 : 0, width: frame ? "auto" : STAGE_W, height: frame ? "auto" : STAGE_H, objectFit: "cover" }} />
         )}
         {card.type === "pdf" && (
           <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 16 }}>
@@ -224,21 +286,20 @@ function CardStage({ card, subCards = [], w, h, hint = false }) {
           </div>
         )}
         {/* カード自身の文字(子から独立したテキストカードなど) */}
-        {typeof card.text === "string" && card.text !== "" && (
+        {(typeof card.text === "string" && card.text !== "" || (card.runs && card.runs.length)) && (
           <div style={{
             position: "absolute", inset: 0, padding: 34,
             fontSize: card.fontSize || 46, color: card.textColor || (dark ? "#fff" : INK),
             fontWeight: 700, whiteSpace: "pre-wrap", lineHeight: 1.3,
-          }}>{card.text}</div>
+            fontFamily: fontCss(card.font),
+            writingMode: card.vertical ? "vertical-rl" : "horizontal-tb",
+          }}><RichText runs={card.runs} text={card.text} baseColor={card.textColor || (dark ? "#fff" : INK)} baseFont={card.font} /></div>
         )}
         {/* 子カード */}
         {subCards.map((ch) => <ChildView key={ch.id} ch={ch} />)}
         {/* 手書き */}
         <svg width={STAGE_W} height={STAGE_H} style={{ position: "absolute", inset: 0 }}>
-          {card.strokes.map((s) => (
-            <polyline key={s.id} points={s.points.map((p) => p.join(",")).join(" ")}
-              fill="none" stroke={s.color} strokeWidth={s.width} strokeLinecap="round" strokeLinejoin="round" />
-          ))}
+          {card.strokes.map((s) => <Stroke key={s.id} s={s} />)}
         </svg>
       </div>
     </div>
@@ -325,6 +386,127 @@ function ConfirmDialog({ message, onOk, onClose }) {
   );
 }
 
+// リッチテキスト編集: 範囲選択して色・フォントを部分適用できる contentEditable
+// 値は runs [{text,color?,font?}] で保持。onApplyで現在の選択範囲に属性を当てる
+function RichEditable({ initialRuns, initialText, baseColor, baseFont, fontSize, style, registerApply }) {
+  const ref = React.useRef(null);
+  const runsRef = React.useRef(
+    (initialRuns && initialRuns.length) ? initialRuns.map((r) => ({ ...r }))
+      : [{ text: initialText || "" }]
+  );
+
+  // runs から DOM(spanの集合)を構築
+  const render = () => {
+    const el = ref.current;
+    if (!el) return;
+    el.innerHTML = "";
+    runsRef.current.forEach((r) => {
+      const span = document.createElement("span");
+      span.textContent = r.text;
+      if (r.color) span.style.color = r.color;
+      if (r.font) span.style.fontFamily = fontCss(r.font);
+      span.dataset.color = r.color || "";
+      span.dataset.font = r.font || "";
+      el.appendChild(span);
+    });
+    if (!runsRef.current.length || runsRef.current.every((r) => !r.text)) {
+      el.innerHTML = "";
+    }
+  };
+
+  React.useEffect(() => { render(); /* 初回のみ */ }, []);
+
+  // DOM → runs(各テキストノードを runs 化)。文字ごとの属性を集約
+  const readChars = () => {
+    const el = ref.current;
+    const chars = [];
+    el.childNodes.forEach((node) => {
+      const color = node.dataset ? node.dataset.color : "";
+      const font = node.dataset ? node.dataset.font : "";
+      const txt = node.textContent || "";
+      for (const c of txt) chars.push({ ch: c, color, font });
+    });
+    return chars;
+  };
+  const charsToRuns = (chars) => {
+    const runs = [];
+    chars.forEach((c) => {
+      const last = runs[runs.length - 1];
+      if (last && (last.color || "") === (c.color || "") && (last.font || "") === (c.font || "")) {
+        last.text += c.ch;
+      } else {
+        runs.push({ text: c.ch, color: c.color || undefined, font: c.font || undefined });
+      }
+    });
+    return runs;
+  };
+
+  // 現在の選択範囲(文字インデックス)を取得
+  const getSelRange = () => {
+    const el = ref.current;
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return null;
+    const range = sel.getRangeAt(0);
+    if (!el.contains(range.startContainer)) return null;
+    const idxOf = (container, offset) => {
+      let count = 0, found = -1;
+      const walk = (node) => {
+        if (found >= 0) return;
+        if (node.nodeType === 3) {
+          if (node === container) { found = count + offset; return; }
+          count += node.textContent.length;
+        } else {
+          node.childNodes.forEach(walk);
+        }
+      };
+      el.childNodes.forEach(walk);
+      return found < 0 ? count : found;
+    };
+    const a = idxOf(range.startContainer, range.startOffset);
+    const b = idxOf(range.endContainer, range.endOffset);
+    return [Math.min(a, b), Math.max(a, b)];
+  };
+
+  // 選択範囲に属性を適用
+  const apply = (attr) => {
+    const sel = getSelRange();
+    const chars = readChars();
+    if (!sel || sel[0] === sel[1]) return false; // 範囲未選択
+    for (let i = sel[0]; i < sel[1] && i < chars.length; i++) {
+      if (attr.color !== undefined) chars[i].color = attr.color;
+      if (attr.font !== undefined) chars[i].font = attr.font;
+    }
+    runsRef.current = charsToRuns(chars);
+    render();
+    return true;
+  };
+
+  // 現在のrunsを返す(確定時に親が読む)
+  const getRuns = () => {
+    const chars = readChars();
+    return charsToRuns(chars);
+  };
+
+  React.useEffect(() => {
+    if (registerApply) registerApply({ apply, getRuns });
+  });
+
+  return (
+    <div
+      ref={ref}
+      contentEditable
+      suppressContentEditableWarning
+      data-empty-text="テキストを入力"
+      onInput={() => { runsRef.current = getRuns(); }}
+      style={{
+        ...style,
+        outline: "none", whiteSpace: "pre-wrap", cursor: "text",
+        color: baseColor, fontFamily: fontCss(baseFont), fontSize,
+      }}
+    />
+  );
+}
+
 const Toast = ({ msg }) => !msg ? null : (
   <div style={{
     position: "fixed", bottom: 100, left: "50%", transform: "translateX(-50%)", zIndex: 300,
@@ -339,7 +521,7 @@ const Toast = ({ msg }) => !msg ? null : (
      長押しで複製・削除/タップで文字編集/ダブルタップで開く/
      ステージの外へドラッグ → 独立カードとして外に出す
    ============================================================ */
-function CardEditor({ cardId, cards, patchCard, addCards, removeDeep, detachChild, pushEdit, depth, onClose, showToast, onUndo = () => {}, onRedo = () => {} }) {
+function CardEditor({ cardId, cards, patchCard, addCards, removeDeep, detachChild, pushEdit, depth, onClose, showToast, onUndo = () => {}, onRedo = () => {}, chainIds = null, onNavigate = () => {} }) {
   const card = cards.find((c) => c.id === cardId);
   const kids = childrenOf(cards, cardId);
   const isChild = card && card.parentId != null;
@@ -347,16 +529,33 @@ function CardEditor({ cardId, cards, patchCard, addCards, removeDeep, detachChil
   const [mode, setMode] = useState("move"); // move | pen
   const [penColor, setPenColor] = useState("#3f4750");
   const [penWidth, setPenWidth] = useState(6);
+  const [penType, setPenType] = useState("pen"); // pen | pencil | marker
+  const [penOpen, setPenOpen] = useState(false); // ペン設定パネル
+  const PEN_WIDTHS = [2, 4, 6, 10, 16];          // 5段階の太さ
+  const [lassoPath, setLassoPath] = useState(null);     // 範囲選択の軌跡(フリーハンド)
+  const [selStrokeIds, setSelStrokeIds] = useState([]); // 選択済みストロークID
+  const lassoRef = useRef(null);     // 矩形ドラッグ中
+  const strokeDrag = useRef(null);   // 選択ストロークの移動
+  const strokeResize = useRef(null); // 選択ストロークの拡大縮小
   const [selected, setSelected] = useState(null);   // 子カードid
   const [inlineEdit, setInlineEdit] = useState(null); // {id, value} 子テキスト編集
   const [selfEdit, setSelfEdit] = useState(null);     // {value} このカード自身の文字編集
   const [childMenu, setChildMenu] = useState(null);   // {id, vx, vy}
   const [connectLine, setConnectLine] = useState(null);
   const [vp, setVp] = useState({ w: window.innerWidth, h: window.innerHeight });
+  const [zoom, setZoom] = useState(1); // カード編集時のズーム倍率
   const stageBox = useRef(null);
+  const scrollBox = useRef(null);
+  const pointers = useRef(new Map());   // 現在触れている指
+  const pinch = useRef(null);           // {dist, zoom} 2本指ピンチ中
+  const barRef = useRef(null);
+  const [barH, setBarH] = useState(58);
+  const swipeRef = useRef(null);
+  const richApi = useRef(null);
   const drawing = useRef(null);
   const dragChild = useRef(null);
   const resizeChild = useRef(null);
+  const baseResize = useRef(null);
   const connRef = useRef(null);
   const longPress = useRef(null);
   const tapRef = useRef({ t: 0, id: null });
@@ -367,11 +566,23 @@ function CardEditor({ cardId, cards, patchCard, addCards, removeDeep, detachChil
     window.addEventListener("resize", f);
     return () => window.removeEventListener("resize", f);
   }, []);
+  const barWatch = `${penOpen}|${mode}|${selected}|${inlineEdit && inlineEdit.id}`;
+  useEffect(() => {
+    // ツールバー(複数段)の合計高さを毎回測ってステージ計算に反映
+    const root = barRef.current && barRef.current.parentElement;
+    if (root) {
+      let h = 0;
+      [...root.children].forEach((c) => { if (c !== scrollBox.current) h += c.offsetHeight; });
+      setBarH(h);
+    } else if (barRef.current) {
+      setBarH(barRef.current.offsetHeight);
+    }
+  }, [vp.w, vp.h, card && card.text, isChild, barWatch]);
 
   if (!card) return null;
 
-  const topBar = 58;
-  const s = Math.min((vp.w - 20) / STAGE_W, (vp.h - topBar - 20) / STAGE_H);
+  const baseS = Math.min((vp.w - 20) / STAGE_W, (vp.h - barH - 20) / STAGE_H);
+  const s = baseS * zoom;
   const dispW = STAGE_W * s, dispH = STAGE_H * s;
 
   const toStage = (e) => {
@@ -381,12 +592,31 @@ function CardEditor({ cardId, cards, patchCard, addCards, removeDeep, detachChil
   const hitChild = (x, y) => [...kids].reverse().find((ch) =>
     x >= ch.x && x <= ch.x + ch.w && y >= ch.y && y <= ch.y + ch.h);
 
+  /* ---- 範囲選択(手書きストローク) ---- */
+  const strokeBBox = (ids) => {
+    const ss = card.strokes.filter((s) => ids.includes(s.id));
+    if (!ss.length) return null;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    ss.forEach((s) => s.points.forEach(([px, py]) => {
+      minX = Math.min(minX, px); minY = Math.min(minY, py);
+      maxX = Math.max(maxX, px); maxY = Math.max(maxY, py);
+    }));
+    return { minX, minY, maxX, maxY };
+  };
+  const selBBox = strokeBBox(selStrokeIds);
+  const transformSelected = (fn) => {
+    patchCard(card.id, { strokes: card.strokes.map((s) =>
+      selStrokeIds.includes(s.id) ? { ...s, points: s.points.map(fn) } : s) });
+  };
+
   // 上部の色選択: ペン色に加えて、
   //  - このカード自身がテキストカードなら card.textColor を変更
   //  - 子テキストをインライン編集中ならその子の textColor を変更
   //  - 子テキストを選択中ならその子の textColor を変更
   const applyColor = (c) => {
     setPenColor(c);
+    // インライン編集中で範囲選択があれば、その部分だけ色変更
+    if (inlineEdit && richApi.current && richApi.current.apply({ color: c })) return;
     if (typeof card.text === "string") {
       patchCard(card.id, { textColor: c });
     } else if (inlineEdit) {
@@ -399,9 +629,13 @@ function CardEditor({ cardId, cards, patchCard, addCards, removeDeep, detachChil
 
   const commitInline = () => {
     if (!inlineEdit) return;
-    const v = inlineEdit.value.replace(/\s+$/, "");
-    if (v === "") removeDeep(inlineEdit.id);
-    else patchCard(inlineEdit.id, { text: v });
+    const runs = richApi.current ? richApi.current.getRuns() : null;
+    const plain = runsToText(runs).replace(/\s+$/, "");
+    if (plain === "") removeDeep(inlineEdit.id);
+    else {
+      const simple = runs && runs.length === 1 && !runs[0].color && !runs[0].font;
+      patchCard(inlineEdit.id, simple ? { text: plain, runs: null } : { text: plain, runs });
+    }
     setInlineEdit(null);
   };
   const commitSelf = () => {
@@ -411,14 +645,48 @@ function CardEditor({ cardId, cards, patchCard, addCards, removeDeep, detachChil
   };
 
   /* ---- ステージ操作 ---- */
+  const dist2 = () => {
+    const ps = [...pointers.current.values()];
+    return Math.hypot(ps[0].x - ps[1].x, ps[0].y - ps[1].y);
+  };
+  const center2 = () => {
+    const ps = [...pointers.current.values()];
+    return { x: (ps[0].x + ps[1].x) / 2, y: (ps[0].y + ps[1].y) / 2 };
+  };
   const down = (e) => {
+    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.current.size === 2) {
+      // 2本指: ピンチズーム開始。進行中の描画・ドラッグを取り消す
+      clearTimeout(longPress.current);
+      if (drawing.current) { patchCard(card.id, { strokes: card.strokes.filter((st) => st.id !== drawing.current.id) }); drawing.current = null; }
+      dragChild.current = null;
+      resizeChild.current = null;
+      pinch.current = { dist: dist2(), zoom, center: center2() };
+      try { e.currentTarget.setPointerCapture(e.pointerId); } catch (err) {}
+      return;
+    }
+    if (pointers.current.size > 2) return;
     if (inlineEdit) { commitInline(); return; }
     if (selfEdit) { commitSelf(); return; }
     setChildMenu(null);
     const [x, y] = toStage(e);
     if (mode === "pen") {
-      drawing.current = { id: uid(), color: penColor, width: penWidth, points: [[x, y]] };
+      drawing.current = { id: uid(), color: penColor, kind: penType,
+        width: penType === "marker" ? Math.max(penWidth * 2.4, 16) : penWidth, points: [[x, y]] };
       patchCard(card.id, { strokes: [...card.strokes, drawing.current] });
+      e.currentTarget.setPointerCapture(e.pointerId);
+      return;
+    }
+    if (mode === "select") {
+      // すでに選択があり、その範囲内を押したら移動開始
+      if (selBBox && x >= selBBox.minX - 12 && x <= selBBox.maxX + 12 && y >= selBBox.minY - 12 && y <= selBBox.maxY + 12) {
+        strokeDrag.current = { sx: x, sy: y };
+      } else {
+        // 新しく矩形選択を開始
+        setSelStrokeIds([]);
+        lassoRef.current = { pts: [[x, y]] };
+        setLassoPath([[x, y]]);
+      }
       e.currentTarget.setPointerCapture(e.pointerId);
       return;
     }
@@ -435,9 +703,54 @@ function CardEditor({ cardId, cards, patchCard, addCards, removeDeep, detachChil
       }, 550);
     } else {
       setSelected(null);
+      // チェーンの一部なら、空き場所からの横スワイプで前後カードへ移動できるよう開始点を記録
+      if (mode === "move" && chainIds && chainIds.length >= 2) {
+        swipeRef.current = { sx: e.clientX, sy: e.clientY };
+        try { e.currentTarget.setPointerCapture(e.pointerId); } catch (err) {}
+      }
     }
   };
   const move = (e) => {
+    if (pointers.current.has(e.pointerId)) pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pinch.current && pointers.current.size >= 2) {
+      // ズーム(指の間隔)
+      const d = dist2();
+      if (pinch.current.dist > 0) {
+        const next = Math.min(3, Math.max(0.5, pinch.current.zoom * (d / pinch.current.dist)));
+        setZoom(Math.round(next * 100) / 100);
+      }
+      // パン(2本指の中心の移動ぶんだけスクロール)
+      const c = center2();
+      if (pinch.current.center && scrollBox.current) {
+        scrollBox.current.scrollLeft -= c.x - pinch.current.center.x;
+        scrollBox.current.scrollTop -= c.y - pinch.current.center.y;
+      }
+      pinch.current.center = c;
+      return;
+    }
+    if (lassoRef.current) {
+      const [x, y] = toStage(e);
+      lassoRef.current.pts.push([x, y]);
+      setLassoPath([...lassoRef.current.pts]);
+      return;
+    }
+    if (strokeDrag.current) {
+      const [x, y] = toStage(e);
+      const dx = x - strokeDrag.current.sx, dy = y - strokeDrag.current.sy;
+      strokeDrag.current.sx = x; strokeDrag.current.sy = y;
+      transformSelected(([px, py]) => [px + dx, py + dy]);
+      return;
+    }
+    if (strokeResize.current) {
+      const [x, y] = toStage(e);
+      const br = strokeResize.current;
+      const sx = (x - br.ax) / (br.bx - br.ax || 1);
+      const sy = (y - br.ay) / (br.by - br.ay || 1);
+      const k = Math.max(0.1, Math.min(sx, sy)); // 縦横比維持
+      transformSelected(([px, py]) => [br.ax + (px - br.ax) * (k / br.lastK), br.ay + (py - br.ay) * (k / br.lastK)]);
+      br.lastK = k;
+      return;
+    }
     if (drawing.current) {
       const [x, y] = toStage(e);
       drawing.current.points.push([x, y]);
@@ -447,7 +760,15 @@ function CardEditor({ cardId, cards, patchCard, addCards, removeDeep, detachChil
     if (resizeChild.current) {
       const [x, y] = toStage(e);
       const ch = cards.find((c) => c.id === resizeChild.current.id);
-      if (ch) patchCard(ch.id, { w: Math.max(60, x - ch.x), h: Math.max(50, y - ch.y) });
+      if (ch) {
+        const nw = Math.max(60, x - ch.x), nh = Math.max(50, y - ch.y);
+        const patch = { w: nw, h: nh };
+        // テキストカードは高さの拡大率に合わせて文字サイズも拡大縮小
+        if (typeof ch.text === "string" && ch.h > 0) {
+          patch.fontSize = Math.max(10, Math.round((ch.fontSize || 46) * (nh / ch.h)));
+        }
+        patchCard(ch.id, patch);
+      }
       return;
     }
     if (dragChild.current) {
@@ -455,11 +776,54 @@ function CardEditor({ cardId, cards, patchCard, addCards, removeDeep, detachChil
       if (!d.moved && Math.hypot(e.clientX - d.sx, e.clientY - d.sy) < 7) return;
       d.moved = true;
       clearTimeout(longPress.current);
+      const dch = cards.find((c) => c.id === d.id);
+      if (dch && dch.pinned) return; // ピン留め中は移動しない
       const [x, y] = toStage(e);
       patchCard(d.id, { x: x - d.dx, y: y - d.dy });
     }
   };
   const up = (e) => {
+    pointers.current.delete(e.pointerId);
+    if (pinch.current) {
+      if (pointers.current.size < 2) pinch.current = null;
+      return; // ピンチの指離しはタップ扱いしない
+    }
+    // 横スワイプでチェーンの前後カードへ移動
+    if (swipeRef.current) {
+      const dx = e.clientX - swipeRef.current.sx;
+      const dy = e.clientY - swipeRef.current.sy;
+      swipeRef.current = null;
+      if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5 && chainIds) {
+        const idx = chainIds.indexOf(cardId);
+        if (dx < 0 && idx < chainIds.length - 1) { onNavigate(chainIds[idx + 1]); return; }
+        if (dx > 0 && idx > 0) { onNavigate(chainIds[idx - 1]); return; }
+      }
+    }
+    // 範囲選択の確定(フリーハンドで囲んだ内側)
+    if (lassoRef.current) {
+      const poly = lassoRef.current.pts;
+      lassoRef.current = null;
+      setLassoPath(null);
+      if (poly && poly.length >= 3) {
+        const inPoly = (px, py) => {
+          let inside = false;
+          for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+            const xi = poly[i][0], yi = poly[i][1], xj = poly[j][0], yj = poly[j][1];
+            if (((yi > py) !== (yj > py)) && (px < ((xj - xi) * (py - yi)) / (yj - yi) + xi)) inside = !inside;
+          }
+          return inside;
+        };
+        const sel = card.strokes.filter((st) => {
+          const n = st.points.filter(([px, py]) => inPoly(px, py)).length;
+          return n > 0 && n >= st.points.length * 0.5;
+        }).map((st) => st.id);
+        setSelStrokeIds(sel);
+        if (!sel.length) showToast("手書きの線をぐるっと囲ってね");
+      }
+      return;
+    }
+    if (strokeDrag.current) { strokeDrag.current = null; return; }
+    if (strokeResize.current) { strokeResize.current = null; return; }
     clearTimeout(longPress.current);
     drawing.current = null;
     resizeChild.current = null;
@@ -532,9 +896,11 @@ function CardEditor({ cardId, cards, patchCard, addCards, removeDeep, detachChil
     setInlineEdit({ id: ch.id, value: "" });
   };
   const addChildImage = (file) => {
-    fileToSrc(file).then((src) => {
-      addCards([{ ...newCard("image", STAGE_W / 2 - 160, STAGE_H / 2 - 110, { parentId: card.id }), w: 320, h: 220, src }]);
-    });
+    const rd = new FileReader();
+    rd.onload = () => {
+      addCards([{ ...newCard("image", STAGE_W / 2 - 160, STAGE_H / 2 - 110, { parentId: card.id }), w: 320, h: 220, src: rd.result }]);
+    };
+    rd.readAsDataURL(file);
   };
 
   const Tool = ({ active, onClick, children, title }) => (
@@ -548,14 +914,33 @@ function CardEditor({ cardId, cards, patchCard, addCards, removeDeep, detachChil
 
   const selectedCh = selected ? kids.find((k) => k.id === selected) : null;
   const inc = buildIncoming(kids);
+  // テキスト編集対象: 自身がテキストカード or テキスト子を選択中 or インライン編集中
+  const textTarget =
+    (inlineEdit && kids.find((k) => k.id === inlineEdit.id)) ||
+    (selectedCh && typeof selectedCh.text === "string" ? selectedCh : null) ||
+    (typeof card.text === "string" ? card : null);
+  const patchText = (patch) => { if (textTarget) patchCard(textTarget.id, patch); };
 
   return (
     <div style={{ position: "fixed", inset: 0, background: EDITOR_BG, zIndex: 100 + depth, display: "flex", flexDirection: "column" }}>
-      <div style={{ height: topBar, display: "flex", alignItems: "center", gap: 8, padding: "0 10px", overflowX: "auto" }}>
+      <div ref={barRef} style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 7, padding: "8px 10px", flexShrink: 0, background: EDITOR_BG, borderBottom: `1px solid ${BORDER}`, rowGap: 7 }}>
         <Tool onClick={onClose} title="戻る">←</Tool>
         {depth > 1 && <span style={{ fontSize: 10, color: SUBTLE, flexShrink: 0 }}>親カードへ</span>}
-        <Tool active={mode === "move"} onClick={() => setMode("move")} title="選択/移動">👆🏻</Tool>
-        <Tool active={mode === "pen"} onClick={() => { setMode("pen"); setSelected(null); }} title="ペン"><img src={ICON_PEN} alt="ペン" draggable={false} style={{ width: 21, height: 21, objectFit: "contain", verticalAlign: "middle" }} /></Tool>
+        <Tool active={mode === "move"} onClick={() => { setMode("move"); setSelStrokeIds([]); setLassoPath(null); }} title="選択/移動">👆🏻</Tool>
+        {chainIds && chainIds.length >= 2 && (() => {
+          const idx = chainIds.indexOf(cardId);
+          return (
+            <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0, background: ACCENT_SOFT, borderRadius: 14, padding: "0 4px" }}>
+              <button onClick={() => idx > 0 && onNavigate(chainIds[idx - 1])} disabled={idx <= 0}
+                title="前のカード" style={{ width: 30, height: 36, border: "none", background: "none", color: idx > 0 ? ACCENT_DEEP : "#c3cad2", fontSize: 18, cursor: idx > 0 ? "pointer" : "default" }}>‹</button>
+              <span style={{ fontSize: 11, color: ACCENT_DEEP, fontWeight: 700, minWidth: 30, textAlign: "center" }}>{idx + 1}/{chainIds.length}</span>
+              <button onClick={() => idx < chainIds.length - 1 && onNavigate(chainIds[idx + 1])} disabled={idx >= chainIds.length - 1}
+                title="次のカード" style={{ width: 30, height: 36, border: "none", background: "none", color: idx < chainIds.length - 1 ? ACCENT_DEEP : "#c3cad2", fontSize: 18, cursor: idx < chainIds.length - 1 ? "pointer" : "default" }}>›</button>
+            </div>
+          );
+        })()}
+        <Tool active={mode === "pen"} onClick={() => { setMode("pen"); setSelected(null); setSelStrokeIds([]); }} title="ペン"><img src={ICON_PEN} alt="ペン" draggable={false} style={{ width: 21, height: 21, objectFit: "contain", verticalAlign: "middle" }} /></Tool>
+        <Tool active={mode === "select"} onClick={() => { setMode("select"); setSelected(null); setPenOpen(false); }} title="範囲選択(手書きを囲って移動・拡大)">⬚</Tool>
         {!isChild && <Tool onClick={addChildText} title="テキストを追加"><img src={ICON_TEXT} alt="あ" draggable={false} style={{ width: 21, height: 21, objectFit: "contain", verticalAlign: "middle" }} /></Tool>}
         {!isChild && <Tool onClick={() => imgInput.current.click()} title="画像を追加"><img src={ICON_IMG} alt="画像" draggable={false} style={{ width: 21, height: 21, objectFit: "contain", verticalAlign: "middle" }} /></Tool>}
         {typeof card.text === "string" && (
@@ -578,17 +963,82 @@ function CardEditor({ cardId, cards, patchCard, addCards, removeDeep, detachChil
             onChange={(e) => applyColor(e.target.value)}
             style={{ position: "absolute", inset: 0, opacity: 0, cursor: "pointer" }} />
         </label>
-        <Tool onClick={() => setPenWidth(penWidth === 6 ? 14 : 6)} title="太さ">{penWidth === 6 ? "─" : "━"}</Tool>
-        <Tool onClick={onUndo} title="ひとつ前に戻す"><img src={ICON_UNDO} alt="undo" draggable={false} style={{ width: 21, height: 21, objectFit: "contain", verticalAlign: "middle" }} /></Tool>
-        <Tool onClick={onRedo} title="戻す前に戻す"><img src={ICON_REDO} alt="redo" draggable={false} style={{ width: 21, height: 21, objectFit: "contain", verticalAlign: "middle" }} /></Tool>
+        <Tool active={penOpen} onClick={() => setPenOpen((v) => !v)} title="ペンの太さ・種類">
+          <span style={{ display: "inline-block", width: 20, height: Math.min(penWidth, 16), borderRadius: 8, background: penType === "pencil" ? "repeating-linear-gradient(90deg, currentColor 0 2px, transparent 2px 4px)" : "currentColor", opacity: penType === "marker" ? 0.4 : 1, color: INK, verticalAlign: "middle" }} />
+        </Tool>
+        <Tool onClick={() => setZoom((z) => Math.max(0.5, Math.round((z - 0.25) * 100) / 100))} title="縮小">−</Tool>
+        <button onClick={() => setZoom(1)} title="ズームを100%に戻す" style={{
+          minWidth: 46, height: 40, borderRadius: 14, fontSize: 12, fontWeight: 700, cursor: "pointer",
+          border: `1px solid ${BORDER}`, background: "#fff", color: zoom !== 1 ? ACCENT_DEEP : INK, flexShrink: 0,
+        }}>{Math.round(zoom * 100)}%</button>
+        <Tool onClick={() => setZoom((z) => Math.min(3, Math.round((z + 0.25) * 100) / 100))} title="拡大">＋</Tool>
+        <Tool onClick={onUndo} title="ひとつ前に戻す"><img src={ICON_REDO} alt="undo" draggable={false} style={{ width: 21, height: 21, objectFit: "contain", verticalAlign: "middle" }} /></Tool>
+        <Tool onClick={onRedo} title="戻す前に戻す"><img src={ICON_UNDO} alt="redo" draggable={false} style={{ width: 21, height: 21, objectFit: "contain", verticalAlign: "middle" }} /></Tool>
         <div style={{ flex: 1 }} />
         <button onClick={onClose} style={{ background: ACCENT_DEEP, border: "none", borderRadius: 16, padding: "6px 18px", fontWeight: 700, color: "#fff", cursor: "pointer", flexShrink: 0, boxShadow: "0 3px 10px rgba(111,156,181,0.4)" }}>完了</button>
       </div>
 
-      <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
+      {/* ペン設定パネル(5段階の太さ + 鉛筆風) */}
+      {penOpen && mode === "pen" && (
+        <div style={{ display: "flex", alignItems: "center", gap: 14, padding: "8px 14px", background: "#fff", borderBottom: `1px solid ${BORDER}`, flexWrap: "wrap", flexShrink: 0 }}>
+          <span style={{ fontSize: 11, color: SUBTLE, letterSpacing: 1 }}>太さ</span>
+          {PEN_WIDTHS.map((w) => (
+            <button key={w} onClick={() => setPenWidth(w)} title={`${w}px`} style={{
+              width: 38, height: 34, borderRadius: 12, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+              border: penWidth === w ? `2px solid ${ACCENT_DEEP}` : `1px solid ${BORDER}`, background: penWidth === w ? ACCENT_SOFT : "#fff",
+            }}>
+              <span style={{ width: 22, height: w, borderRadius: 6, background: INK, display: "inline-block" }} />
+            </button>
+          ))}
+          <div style={{ width: 1, height: 26, background: BORDER }} />
+          <span style={{ fontSize: 11, color: SUBTLE, letterSpacing: 1 }}>種類</span>
+          {[["pen", "ペン"], ["pencil", "✏️ 鉛筆"], ["marker", "🖍 マーカー"]].map(([t, label]) => (
+            <button key={t} onClick={() => setPenType(t)} style={{
+              padding: "6px 12px", borderRadius: 12, fontSize: 12, cursor: "pointer",
+              border: penType === t ? `2px solid ${ACCENT_DEEP}` : `1px solid ${BORDER}`,
+              background: penType === t ? ACCENT_SOFT : "#fff", color: INK,
+            }}>{label}</button>
+          ))}
+        </div>
+      )}
+
+      {/* テキスト設定バー(テキストカードが対象のとき表示: フォント / 文字サイズ / 縦書き横書き) */}
+      {mode === "move" && textTarget && (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 14px", background: "#fff", borderBottom: `1px solid ${BORDER}`, flexWrap: "wrap", flexShrink: 0 }}>
+          <span style={{ fontSize: 11, color: SUBTLE, letterSpacing: 1 }}>あ</span>
+          {FONT_OPTIONS.map((f) => (
+            <button key={f.id} onClick={() => {
+              if (inlineEdit && richApi.current && richApi.current.apply({ font: f.id })) return;
+              patchText({ font: f.id });
+            }} style={{
+              padding: "5px 10px", borderRadius: 10, fontSize: 12, cursor: "pointer", fontFamily: f.css,
+              border: (textTarget.font || "sans") === f.id ? `2px solid ${ACCENT_DEEP}` : `1px solid ${BORDER}`,
+              background: (textTarget.font || "sans") === f.id ? ACCENT_SOFT : "#fff", color: INK,
+            }}>{f.label}</button>
+          ))}
+          <div style={{ width: 1, height: 24, background: BORDER }} />
+          <span style={{ fontSize: 11, color: SUBTLE, letterSpacing: 1 }}>サイズ</span>
+          <button onClick={() => patchText({ fontSize: Math.max(16, (textTarget.fontSize || 46) - 6) })} style={{
+            width: 32, height: 32, borderRadius: 10, border: `1px solid ${BORDER}`, background: "#fff", color: INK, fontSize: 16, cursor: "pointer",
+          }}>−</button>
+          <span style={{ fontSize: 12, color: INK, minWidth: 30, textAlign: "center" }}>{textTarget.fontSize || 46}</span>
+          <button onClick={() => patchText({ fontSize: Math.min(160, (textTarget.fontSize || 46) + 6) })} style={{
+            width: 32, height: 32, borderRadius: 10, border: `1px solid ${BORDER}`, background: "#fff", color: INK, fontSize: 16, cursor: "pointer",
+          }}>＋</button>
+          <div style={{ width: 1, height: 24, background: BORDER }} />
+          <button onClick={() => patchText({ vertical: !textTarget.vertical })} style={{
+            padding: "6px 12px", borderRadius: 10, fontSize: 12, cursor: "pointer",
+            border: textTarget.vertical ? `2px solid ${ACCENT_DEEP}` : `1px solid ${BORDER}`,
+            background: textTarget.vertical ? ACCENT_SOFT : "#fff", color: INK,
+          }}>{textTarget.vertical ? "縦書き" : "横書き"}</button>
+        </div>
+      )}
+
+      <div ref={scrollBox} style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", overflow: "auto" }}>
+        <div style={{ margin: "auto", padding: 26, flexShrink: 0, position: "relative" }}>
         <div ref={stageBox}
           onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}
-          style={{ width: dispW, height: dispH, position: "relative", boxShadow: "0 14px 40px rgba(60,68,78,0.35)", borderRadius: 8, touchAction: "none", cursor: mode === "pen" ? "crosshair" : "default" }}>
+          style={{ width: dispW, height: dispH, position: "relative", boxShadow: "0 14px 40px rgba(60,68,78,0.35)", borderRadius: 8, touchAction: "none", cursor: (mode === "pen" || mode === "select") ? "crosshair" : "default" }}>
           <CardStage
             card={card}
             subCards={inlineEdit ? kids.filter((k) => k.id !== inlineEdit.id) : kids}
@@ -620,6 +1070,49 @@ function CardEditor({ cardId, cards, patchCard, addCards, removeDeep, detachChil
             )}
           </svg>
 
+          {/* 範囲選択(フリーハンドの軌跡) */}
+          {lassoPath && lassoPath.length > 1 && (
+            <svg width={dispW} height={dispH} viewBox={`0 0 ${STAGE_W} ${STAGE_H}`} preserveAspectRatio="none"
+              style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 5 }}>
+              <polygon points={lassoPath.map((p) => p.join(",")).join(" ")}
+                fill="rgba(167,201,219,0.18)" stroke={ACCENT_DEEP} strokeWidth="2.5"
+                strokeDasharray="8 6" strokeLinejoin="round" />
+            </svg>
+          )}
+          {/* 選択済みストロークの枠 + 操作ハンドル */}
+          {mode === "select" && selBBox && selStrokeIds.length > 0 && (
+            <>
+              <div style={{
+                position: "absolute", left: selBBox.minX * s - 6, top: selBBox.minY * s - 6,
+                width: (selBBox.maxX - selBBox.minX) * s + 12, height: (selBBox.maxY - selBBox.minY) * s + 12,
+                border: `1.5px solid ${ACCENT_DEEP}`, borderRadius: 6, pointerEvents: "none", zIndex: 5,
+                background: "rgba(167,201,219,0.08)",
+              }} />
+              {/* 削除 */}
+              <button onPointerDown={(e) => e.stopPropagation()}
+                onClick={() => { patchCard(card.id, { strokes: card.strokes.filter((st) => !selStrokeIds.includes(st.id)) }); setSelStrokeIds([]); }}
+                style={{
+                  position: "absolute", left: selBBox.minX * s - 6 - 11, top: selBBox.minY * s - 6 - 11,
+                  width: 24, height: 24, borderRadius: 12, border: "none", background: "#d04030", color: "#fff",
+                  fontSize: 12, cursor: "pointer", zIndex: 7, boxShadow: "0 2px 6px rgba(60,68,78,0.4)",
+                }}>🗑</button>
+              {/* 拡大縮小(右下) */}
+              <div
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  strokeResize.current = { ax: selBBox.minX, ay: selBBox.minY, bx: selBBox.maxX, by: selBBox.maxY, lastK: 1 };
+                  try { e.currentTarget.setPointerCapture(e.pointerId); } catch (err) {}
+                }}
+                onPointerMove={(e) => { if (strokeResize.current) move(e); }}
+                onPointerUp={() => { strokeResize.current = null; }}
+                style={{
+                  position: "absolute", left: selBBox.maxX * s + 6 - 11, top: selBBox.maxY * s + 6 - 11,
+                  width: 22, height: 22, borderRadius: 11, background: ACCENT_DEEP, border: "2px solid #fff",
+                  cursor: "nwse-resize", touchAction: "none", zIndex: 7, boxShadow: "0 2px 6px rgba(60,68,78,0.4)",
+                }} />
+            </>
+          )}
+
           {/* 選択中の子カード: 枠 + ハンドル */}
           {selectedCh && mode === "move" && (
             <>
@@ -647,16 +1140,24 @@ function CardEditor({ cardId, cards, patchCard, addCards, removeDeep, detachChil
                     fontSize: 9, padding: "0 8px", cursor: "pointer", zIndex: 6,
                   }}>解除</button>
               )}
-              {/* リサイズ(右下角) */}
-              <div
-                onPointerDown={(e) => { e.stopPropagation(); resizeChild.current = { id: selectedCh.id }; e.currentTarget.setPointerCapture(e.pointerId); }}
-                onPointerMove={(e) => { if (resizeChild.current) move(e); }}
-                onPointerUp={() => { resizeChild.current = null; }}
-                style={{
-                  position: "absolute", left: (selectedCh.x + selectedCh.w) * s - 10, top: (selectedCh.y + selectedCh.h) * s - 10,
-                  width: 20, height: 20, borderRadius: 10, background: ACCENT_DEEP, border: "2px solid #fff",
-                  cursor: "nwse-resize", zIndex: 6, touchAction: "none", boxShadow: "0 2px 6px rgba(60,68,78,0.35)",
-                }} />
+              {/* リサイズ(右下角・ピン留め中は非表示) */}
+              {!selectedCh.pinned && (
+                <div
+                  onPointerDown={(e) => { e.stopPropagation(); resizeChild.current = { id: selectedCh.id }; e.currentTarget.setPointerCapture(e.pointerId); }}
+                  onPointerMove={(e) => { if (resizeChild.current) move(e); }}
+                  onPointerUp={() => { resizeChild.current = null; }}
+                  style={{
+                    position: "absolute", left: (selectedCh.x + selectedCh.w) * s - 10, top: (selectedCh.y + selectedCh.h) * s - 10,
+                    width: 20, height: 20, borderRadius: 10, background: ACCENT_DEEP, border: "2px solid #fff",
+                    cursor: "nwse-resize", zIndex: 6, touchAction: "none", boxShadow: "0 2px 6px rgba(60,68,78,0.35)",
+                  }} />
+              )}
+              {selectedCh.pinned && (
+                <div style={{
+                  position: "absolute", left: selectedCh.x * s - 4, top: selectedCh.y * s - 10,
+                  fontSize: 15, zIndex: 6, pointerEvents: "none",
+                }}>📌</div>
+              )}
             </>
           )}
 
@@ -667,20 +1168,30 @@ function CardEditor({ cardId, cards, patchCard, addCards, removeDeep, detachChil
             return (
               <div onPointerDown={(e) => e.stopPropagation()}
                 style={{ position: "absolute", left: ch.x * s, top: ch.y * s, zIndex: 7 }}>
-                <textarea autoFocus value={inlineEdit.value}
-                  onChange={(e) => setInlineEdit({ ...inlineEdit, value: e.target.value })}
-                  placeholder="テキストを入力"
+                <RichEditable
+                  initialRuns={ch.runs} initialText={ch.text}
+                  baseColor={ch.textColor || INK} baseFont={ch.font}
+                  fontSize={Math.max((ch.fontSize || 46) * s, 14)}
+                  registerApply={(api) => { richApi.current = api; }}
                   style={{
-                    width: Math.max(ch.w * s, 150), minHeight: Math.max(ch.h * s, 48),
-                    fontSize: Math.max((ch.fontSize || 46) * s, 14), fontWeight: 700, color: ch.textColor || INK, lineHeight: 1.25,
-                    background: "rgba(255,255,255,0.9)", border: `2px dashed ${ACCENT_DEEP}`, borderRadius: 8,
-                    padding: 5, resize: "both", outline: "none", fontFamily: "inherit",
+                    width: Math.max(ch.w * s, 150), minHeight: Math.max(ch.h * s, 48), fontWeight: 700, lineHeight: 1.3,
+                    background: "rgba(255,255,255,0.92)", border: `2px dashed ${ACCENT_DEEP}`, borderRadius: 8, padding: 5,
                   }} />
-                <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
-                  <button onClick={commitInline} style={{ background: ACCENT_DEEP, color: "#fff", border: "none", borderRadius: 12, padding: "5px 14px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>確定</button>
+                <div style={{ display: "flex", gap: 6, marginTop: 4, flexWrap: "wrap" }}>
+                  <button onClick={() => {
+                    const runs = richApi.current ? richApi.current.getRuns() : null;
+                    const plain = runsToText(runs).replace(/\\s+$/, "");
+                    if (plain === "") { removeDeep(inlineEdit.id); }
+                    else {
+                      const simple = runs && runs.length === 1 && !runs[0].color && !runs[0].font;
+                      patchCard(inlineEdit.id, simple ? { text: plain, runs: null } : { text: plain, runs });
+                    }
+                    setInlineEdit(null);
+                  }} style={{ background: ACCENT_DEEP, color: "#fff", border: "none", borderRadius: 12, padding: "5px 14px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>確定</button>
                   <button onClick={() => { removeDeep(inlineEdit.id); setInlineEdit(null); setSelected(null); }}
                     style={{ background: "#d04030", color: "#fff", border: "none", borderRadius: 12, padding: "5px 14px", fontSize: 13, cursor: "pointer" }}>削除</button>
                   <button onClick={() => setInlineEdit(null)} style={{ background: "#fff", color: INK, border: `1px solid ${BORDER}`, borderRadius: 12, padding: "5px 14px", fontSize: 13, cursor: "pointer" }}>取消</button>
+                  <span style={{ fontSize: 10, color: SUBTLE, alignSelf: "center" }}>文字を選んで上のフォント・色を押すと部分変更できます</span>
                 </div>
               </div>
             );
@@ -706,6 +1217,39 @@ function CardEditor({ cardId, cards, patchCard, addCards, removeDeep, detachChil
             </div>
           )}
         </div>
+        {/* ベースカードの四隅リサイズ(カード自体の大きさを変える) */}
+        {mode === "move" && !inlineEdit && !selfEdit && [
+          ["nw", 0, 0, "nwse-resize"], ["ne", 1, 0, "nesw-resize"],
+          ["sw", 0, 1, "nesw-resize"], ["se", 1, 1, "nwse-resize"],
+        ].map(([k, hx, hy, cur]) => (
+          <div key={k}
+            onPointerDown={(e) => {
+              e.stopPropagation();
+              baseResize.current = { k, sx: e.clientX, sy: e.clientY, w0: card.w, h0: card.h, fs0: card.fontSize || 46 };
+              try { e.currentTarget.setPointerCapture(e.pointerId); } catch (err) {}
+            }}
+            onPointerMove={(e) => {
+              const br = baseResize.current;
+              if (!br) return;
+              const ddx = (e.clientX - br.sx) / s * (hx === 1 ? 1 : -1);
+              const ddy = (e.clientY - br.sy) / s * (hy === 1 ? 1 : -1);
+              const nw = Math.max(120, Math.round(br.w0 + ddx));
+              const nh = Math.max(90, Math.round(br.h0 + ddy));
+              const patch = { w: nw, h: nh };
+              if (typeof card.text === "string" && br.h0 > 0) patch.fontSize = Math.max(10, Math.round(br.fs0 * (nh / br.h0)));
+              patchCard(card.id, patch);
+            }}
+            onPointerUp={(e) => { baseResize.current = null; try { e.currentTarget.releasePointerCapture(e.pointerId); } catch (err) {} }}
+            style={{
+              position: "absolute",
+              left: 26 + hx * dispW - 13, top: 26 + hy * dispH - 13,
+              width: 26, height: 26, borderRadius: 13, background: "#fff",
+              border: `2px solid ${ACCENT_DEEP}`, boxShadow: "0 2px 8px rgba(60,68,78,0.4)",
+              cursor: cur, touchAction: "none", zIndex: 8,
+              display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: ACCENT_DEEP,
+            }}>⤡</div>
+        ))}
+        </div>
       </div>
 
       {/* 子カードの長押しメニュー */}
@@ -723,6 +1267,7 @@ function CardEditor({ cardId, cards, patchCard, addCards, removeDeep, detachChil
                 addCards([{ ...ch, id: uid(), x: ch.x + 30, y: ch.y + 30, next: null,
                   strokes: ch.strokes.map((st) => ({ ...st, id: uid(), points: st.points.map((p) => [...p]) })) }]);
               }],
+              [ch.pinned ? "📌 ピン解除" : "📌 ピン留め", () => patchCard(ch.id, { pinned: !ch.pinned })],
               ["📤 外に出す", () => { detachChild(ch.id); setSelected(null); showToast("キャンバスに独立カードとして置きました"); }],
               ["🗑 削除", () => { removeDeep(ch.id); setSelected(null); }],
             ].map(([label, fn]) => (
@@ -800,6 +1345,11 @@ function SwipeViewer({ chain, allCards, onClose, onEdit }) {
 function CanvasScreen({ note, group, groups, onUpdateCards, onBack, materialBox, setMaterialBox, onSendCard, tut = null, onTutAdvance = () => {}, onTutEnd = () => {} }) {
   const cards = note.cards;
   const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [scale, setScale] = useState(1); // キャンバスのズーム倍率
+  const [zoomAnim, setZoomAnim] = useState(false); // ボタン操作時だけ滑らかに
+  const bgPointers = useRef(new Map());  // 背景に触れている指
+  const bgPinch = useRef(null);          // {dist, scale, cx, cy, panx, pany}
+  const zoomAnimTimer = useRef(null);
   const [editStack, setEditStack] = useState([]);   // 開いているカードの階層
   const [viewerHead, setViewerHead] = useState(null);
   const [menu, setMenu] = useState(null);
@@ -821,6 +1371,7 @@ function CanvasScreen({ note, group, groups, onUpdateCards, onBack, materialBox,
   const resizeRef = useRef(null);
   const connectRef = useRef(null);
   const tapRef = useRef({ t: 0, id: null });
+  const tapTimer = useRef(null);
   const longPress = useRef(null);
   const fileInput = useRef(null);
   const pdfInput = useRef(null);
@@ -882,12 +1433,13 @@ function CanvasScreen({ note, group, groups, onUpdateCards, onBack, materialBox,
     m.count = Math.max(0, m.count - 1);
     if (m.count === 0) {
       const quick = Date.now() - m.t < 420;
-      const blocked = editStack.length > 0 || viewerHead || boxOpen || boxDrop || shareDrop || menu;
+      const pinched = bgPinch.current || multiRef.current.pinched;
+      const blocked = editStack.length > 0 || viewerHead || boxOpen || boxDrop || shareDrop || menu || pinched;
       if (quick && !blocked) {
         if (m.max === 2) undo();
         else if (m.max === 3) redo();
       }
-      multiRef.current = { count: 0, max: 0, t: 0 };
+      multiRef.current = { count: 0, max: 0, t: 0, pinched: false };
     }
   };
   const patchCard = (id, patch) => setCards((cs) => cs.map((c) => (c.id === id ? { ...c, ...patch } : c)));
@@ -939,7 +1491,23 @@ function CanvasScreen({ note, group, groups, onUpdateCards, onBack, materialBox,
 
   const toCanvas = (e) => {
     const r = viewport.current.getBoundingClientRect();
-    return [e.clientX - r.left - pan.x, e.clientY - r.top - pan.y];
+    return [(e.clientX - r.left - pan.x) / scale, (e.clientY - r.top - pan.y) / scale];
+  };
+  // ズーム(focalを中心に拡大縮小。focalはビューポート内のpx座標)
+  const zoomAt = (nextScale, fx, fy) => {
+    const ns = Math.min(3, Math.max(0.3, nextScale));
+    setPan((p) => ({
+      x: fx - (fx - p.x) * (ns / scale),
+      y: fy - (fy - p.y) * (ns / scale),
+    }));
+    setScale(ns);
+  };
+  const zoomButton = (factor) => {
+    const r = viewport.current ? viewport.current.getBoundingClientRect() : { width: 800, height: 600 };
+    setZoomAnim(true);
+    clearTimeout(zoomAnimTimer.current);
+    zoomAnimTimer.current = setTimeout(() => setZoomAnim(false), 260);
+    zoomAt(scale * factor, r.width / 2, r.height / 2);
   };
   const overEl = (e, ref) => {
     if (!ref.current) return false;
@@ -948,17 +1516,112 @@ function CanvasScreen({ note, group, groups, onUpdateCards, onBack, materialBox,
   };
   const cloneBundleOf = (id, pos) => cloneBundle(collectBundle(cards, id), pos);
 
-  /* ---- 背景パン ---- */
+  // 連結チェーン全体(親+子)を丸ごと複製。矢印のつながりも維持
+  const duplicateChain = (headId) => {
+    const chain = chainFrom(topLevel, headId);
+    const idMap = {};
+    const all = [];
+    chain.forEach((c) => {
+      const bundle = collectBundle(cards, c.id);
+      const m = {};
+      bundle.forEach((b) => { m[b.id] = uid(); });
+      idMap[c.id] = m[c.id];
+      bundle.forEach((b, i) => {
+        all.push({
+          ...b, id: m[b.id],
+          parentId: b.parentId ? (m[b.parentId] || null) : null,
+          x: i === 0 ? b.x + 36 : b.x, y: i === 0 ? b.y + 36 : b.y,
+          next: null, collapsed: false,
+          strokes: b.strokes.map((s) => ({ ...s, id: uid(), points: s.points.map((p) => [...p]) })),
+          tags: [...b.tags],
+        });
+      });
+    });
+    // 矢印の再リンク
+    chain.forEach((c) => {
+      if (c.next && idMap[c.next]) {
+        const nc = all.find((a) => a.id === idMap[c.id]);
+        if (nc) nc.next = idMap[c.next];
+      }
+    });
+    addCards(all);
+  };
+
+  // チェーン全体を削除
+  const deleteChain = (headId) => {
+    chainFrom(topLevel, headId).forEach((c) => removeDeep(c.id));
+  };
+
+  // チェーンを矢印順にきれいに整列(横一列、収まらなければ折り返して格子に)
+  const alignChain = (headId) => {
+    const chain = chainFrom(topLevel, headId);
+    if (chain.length < 2) return;
+    const gap = 28;
+    const maxW = Math.max(...chain.map((c) => c.w));
+    const maxH = Math.max(...chain.map((c) => c.h));
+    const viewW = viewport.current ? viewport.current.getBoundingClientRect().width : 900;
+    const perRow = Math.max(1, Math.floor((viewW - 80) / (maxW + gap)));
+    const x0 = chain[0].x, y0 = chain[0].y;
+    setCards((cs) => cs.map((c) => {
+      const idx = chain.findIndex((x) => x.id === c.id);
+      if (idx < 0) return c;
+      const row = Math.floor(idx / perRow), col = idx % perRow;
+      return { ...c, x: x0 + col * (maxW + gap), y: y0 + row * (maxH + gap), pinned: false };
+    }));
+    showToast("整列しました");
+  };
+
+  /* ---- 背景パン + ピンチズーム ---- */
+  const bgDist = () => {
+    const ps = [...bgPointers.current.values()];
+    return Math.hypot(ps[0].x - ps[1].x, ps[0].y - ps[1].y);
+  };
+  const bgCenter = () => {
+    const ps = [...bgPointers.current.values()];
+    const r = viewport.current.getBoundingClientRect();
+    return { x: (ps[0].x + ps[1].x) / 2 - r.left, y: (ps[0].y + ps[1].y) / 2 - r.top };
+  };
   const bgDown = (e) => {
+    bgPointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (bgPointers.current.size === 2) {
+      panRef.current = null; // 1本指パンを中断
+      const c = bgCenter();
+      setZoomAnim(false);
+      bgPinch.current = { dist: bgDist(), scale, cx: c.x, cy: c.y, panx: pan.x, pany: pan.y, lastc: c };
+      try { e.currentTarget.setPointerCapture(e.pointerId); } catch (err) {}
+      return;
+    }
+    if (bgPointers.current.size > 2) return;
     panRef.current = { sx: e.clientX, sy: e.clientY, px: pan.x, py: pan.y };
     e.currentTarget.setPointerCapture(e.pointerId);
     setMenu(null);
     setPalette(false);
   };
   const bgMove = (e) => {
+    if (bgPointers.current.has(e.pointerId)) bgPointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (bgPinch.current && bgPointers.current.size >= 2) {
+      const d = bgDist();
+      const c = bgCenter();
+      const bp = bgPinch.current;
+      if (bp.dist > 0) {
+        const ns = Math.min(3, Math.max(0.3, bp.scale * (d / bp.dist)));
+        // 2本指の中心を基準に拡大しつつ、中心の移動ぶんパンも反映
+        setPan({
+          x: c.x - (bp.cx - bp.panx) * (ns / bp.scale) + (c.x - bp.cx),
+          y: c.y - (bp.cy - bp.pany) * (ns / bp.scale) + (c.y - bp.cy),
+        });
+        setScale(ns);
+        multiRef.current.pinched = true;
+      }
+      return;
+    }
     if (panRef.current) setPan({ x: panRef.current.px + e.clientX - panRef.current.sx, y: panRef.current.py + e.clientY - panRef.current.sy });
   };
-  const bgUp = () => { panRef.current = null; };
+  const bgUp = (e) => {
+    bgPointers.current.delete(e.pointerId);
+    if (bgPinch.current && bgPointers.current.size < 2) bgPinch.current = null;
+    if (bgPointers.current.size === 0) panRef.current = null;
+  };
 
   /* ---- カード操作 ---- */
   const cardDown = (card) => (e) => {
@@ -1002,22 +1665,30 @@ function CanvasScreen({ note, group, groups, onUpdateCards, onBack, materialBox,
       else if (overEl(e, shareBtnRef)) setShareDrop(card.id);
       return;
     }
-    // タップ判定
+    // タップ判定(1回=閲覧 / 2回=編集 / 3回=まとめ・展開)
     const now = Date.now();
     const isHead = !incoming[card.id] && card.next;
-    if (tapRef.current.id === card.id && now - tapRef.current.t < 320) {
-      tapRef.current = { t: 0, id: null };
-      // ダブルタップ: 連結1枚目→まとめ/展開、それ以外→編集
-      if (isHead) patchCard(card.id, { collapsed: !card.collapsed });
-      else setEditStack([card.id]);
+    if (tapRef.current.id === card.id && now - tapRef.current.t < 360) {
+      tapRef.current = { id: card.id, t: now, count: (tapRef.current.count || 1) + 1 };
     } else {
-      tapRef.current = { t: now, id: card.id };
-      if (isHead && card.collapsed) {
-        setTimeout(() => {
-          if (tapRef.current.id === card.id) setViewerHead(card.id);
-        }, 330);
-      }
+      tapRef.current = { id: card.id, t: now, count: 1 };
     }
+    const myTap = tapRef.current.count;
+    clearTimeout(tapTimer.current);
+    tapTimer.current = setTimeout(() => {
+      if (tapRef.current.id !== card.id) return;
+      const cnt = tapRef.current.count;
+      tapRef.current = { t: 0, id: null, count: 0 };
+      if (cnt >= 3) {
+        // 3回タップ: 連結チェーンのまとめ/展開
+        if (isHead) patchCard(card.id, { collapsed: !card.collapsed });
+        else showToast("まとめるには、矢印でつないだ先頭のカードを3回タップしてね");
+      } else if (cnt === 2) {
+        setEditStack([card.id]); // 編集
+      } else {
+        if (isHead && card.collapsed) setViewerHead(card.id); // 閲覧
+      }
+    }, 360);
   };
 
   /* ---- リサイズ ---- */
@@ -1029,7 +1700,12 @@ function CanvasScreen({ note, group, groups, onUpdateCards, onBack, materialBox,
   const resizeMove = (card) => (e) => {
     if (!resizeRef.current || resizeRef.current.id !== card.id) return;
     const [cx, cy] = toCanvas(e);
-    patchCard(card.id, { w: Math.max(90, cx - card.x), h: Math.max(70, cy - card.y) });
+    const nw = Math.max(90, cx - card.x), nh = Math.max(70, cy - card.y);
+    const patch = { w: nw, h: nh };
+    if (typeof card.text === "string" && card.h > 0) {
+      patch.fontSize = Math.max(10, Math.round((card.fontSize || 46) * (nh / card.h)));
+    }
+    patchCard(card.id, patch);
   };
   const resizeUp = () => { resizeRef.current = null; };
 
@@ -1064,7 +1740,8 @@ function CanvasScreen({ note, group, groups, onUpdateCards, onBack, materialBox,
   /* ---- カード追加 ---- */
   const spawnPos = () => {
     const r = viewport.current ? viewport.current.getBoundingClientRect() : { width: 800, height: 600 };
-    return [r.width / 2 - pan.x - 110 + Math.random() * 60, r.height / 2 - pan.y - 100 + Math.random() * 60];
+    const cx = (r.width / 2 - pan.x) / scale, cy = (r.height / 2 - pan.y) / scale;
+    return [cx - 110 + Math.random() * 60, cy - 100 + Math.random() * 60];
   };
   const addText = (color) => {
     const [x, y] = spawnPos();
@@ -1084,7 +1761,11 @@ function CanvasScreen({ note, group, groups, onUpdateCards, onBack, materialBox,
     const arr = Array.from(files);
     if (!arr.length) return;
     const [bx, by] = spawnPos();
-    Promise.all(arr.map((f) => fileToSrc(f))).then((srcs) => {
+    Promise.all(arr.map((f) => new Promise((res) => {
+      const rd = new FileReader();
+      rd.onload = () => res(rd.result);
+      rd.readAsDataURL(f);
+    }))).then((srcs) => {
       const created = srcs.map((src, i) => newCard("image", bx + i * 36, by + i * 28, { src }));
       for (let i = 0; i < created.length - 1; i++) created[i].next = created[i + 1].id;
       if (created.length >= 2) created[0].collapsed = true;
@@ -1120,7 +1801,7 @@ function CanvasScreen({ note, group, groups, onUpdateCards, onBack, materialBox,
       <div ref={viewport}
         onPointerDown={bgDown} onPointerMove={bgMove} onPointerUp={bgUp} onPointerCancel={bgUp}
         style={{ position: "absolute", inset: 0, touchAction: "none", cursor: "grab" }}>
-        <div style={{ position: "absolute", left: 0, top: 0, transform: `translate(${pan.x}px, ${pan.y}px)` }}>
+        <div style={{ position: "absolute", left: 0, top: 0, transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})`, transformOrigin: "0 0", transition: zoomAnim ? "transform 0.22s cubic-bezier(0.22,0.61,0.36,1)" : "none", willChange: "transform" }}>
           {/* 接続線 */}
           <svg style={{ position: "absolute", left: 0, top: 0, width: 1, height: 1, overflow: "visible", pointerEvents: "none" }}>
             <defs>
@@ -1247,6 +1928,17 @@ function CanvasScreen({ note, group, groups, onUpdateCards, onBack, materialBox,
         </div>
       </div>
 
+      {/* ズームコントロール(右下) */}
+      <div style={{
+        position: "absolute", right: 12, bottom: 92, zIndex: 10,
+        display: "flex", flexDirection: "column", alignItems: "center",
+        background: "rgba(255,255,255,0.96)", borderRadius: 18, boxShadow: "0 6px 16px rgba(15,18,22,0.4)", overflow: "hidden",
+      }}>
+        <button onClick={() => zoomButton(1.25)} title="拡大" style={{ width: 40, height: 38, border: "none", borderBottom: `1px solid ${BORDER}`, background: "none", color: INK, fontSize: 20, cursor: "pointer" }}>＋</button>
+        <button onClick={() => { setZoomAnim(true); clearTimeout(zoomAnimTimer.current); zoomAnimTimer.current = setTimeout(() => setZoomAnim(false), 260); setScale(1); setPan({ x: 0, y: 0 }); }} title="100%に戻す" style={{ width: 40, height: 30, border: "none", borderBottom: `1px solid ${BORDER}`, background: "none", color: scale !== 1 ? ACCENT_DEEP : SUBTLE, fontSize: 9, fontWeight: 700, cursor: "pointer" }}>{Math.round(scale * 100)}%</button>
+        <button onClick={() => zoomButton(0.8)} title="縮小" style={{ width: 40, height: 38, border: "none", background: "none", color: INK, fontSize: 20, cursor: "pointer" }}>−</button>
+      </div>
+
       {/* 下中央: ツールドック(資料箱・共有もここに統合) */}
       <div style={{
         position: "absolute", bottom: 14, left: "50%", transform: "translateX(-50%)", zIndex: 10,
@@ -1337,18 +2029,39 @@ function CanvasScreen({ note, group, groups, onUpdateCards, onBack, materialBox,
             background: "#fff", borderRadius: 14, boxShadow: "0 10px 30px rgba(15,18,22,0.5)", zIndex: 50,
             overflow: "hidden", width: 165,
           }}>
-            {[
-              ["📑 複製", () => addCards(cloneBundleOf(c.id, [c.x + 30, c.y + 30]))],
-              [c.pinned ? "📌 ピン解除" : "📌 ピン留め", () => patchCard(c.id, { pinned: !c.pinned })],
-              ...(c.type === "text" ? [["🎨 カードの色", () => setPalette({ cardId: c.id })]] : []),
-              ["🏷 タグを追加", () => {
-                setPromptD({
-                  title: "タグ名を入力", initial: "",
-                  cb: (t) => { if (!c.tags.includes(t)) patchCard(c.id, { tags: [...c.tags, t] }); },
-                });
-              }],
-              ["🗑 削除", () => removeDeep(c.id)],
-            ].map(([label, fn]) => (
+            {(() => {
+              const incomingTop = buildIncoming(topLevel);
+              const isHead = !incomingTop[c.id] && c.next;       // 連結チェーンの先頭
+              const isMerged = isHead && c.collapsed;            // まとめ済み
+              const items = [];
+              if (isMerged) {
+                // まとめ済み: グループごと複製/削除
+                items.push(["📑 まとめて複製", () => duplicateChain(c.id)]);
+                items.push(["🔓 まとめを解除", () => patchCard(c.id, { collapsed: false })]);
+                items.push(["🗑 まとめて削除", () => deleteChain(c.id)]);
+              } else if (isHead) {
+                // 連結済みだがバラバラ: 整列ボタン
+                items.push(["📑 複製", () => addCards(cloneBundleOf(c.id, [c.x + 30, c.y + 30]))]);
+                items.push(["📐 整列", () => alignChain(c.id)]);
+                items.push(["🔗 まとめる", () => patchCard(c.id, { collapsed: true })]);
+                items.push([c.pinned ? "📌 ピン解除" : "📌 ピン留め", () => patchCard(c.id, { pinned: !c.pinned })]);
+                items.push(["🎨 カードの色", () => setPalette({ cardId: c.id })]);
+                items.push(["🗑 削除", () => removeDeep(c.id)]);
+              } else {
+                // 単独カード(画像・テキスト・PDFすべて)
+                items.push(["📑 複製", () => addCards(cloneBundleOf(c.id, [c.x + 30, c.y + 30]))]);
+                items.push([c.pinned ? "📌 ピン解除" : "📌 ピン留め", () => patchCard(c.id, { pinned: !c.pinned })]);
+                items.push(["🎨 カードの色", () => setPalette({ cardId: c.id })]);
+                items.push(["🏷 タグを追加", () => {
+                  setPromptD({
+                    title: "タグ名を入力", initial: "",
+                    cb: (t) => { if (!c.tags.includes(t)) patchCard(c.id, { tags: [...c.tags, t] }); },
+                  });
+                }]);
+                items.push(["🗑 削除", () => removeDeep(c.id)]);
+              }
+              return items;
+            })().map(([label, fn]) => (
               <button key={label} onClick={() => { fn(); setMenu(null); }} style={{
                 display: "block", width: "100%", padding: "11px 14px", border: "none", background: "none",
                 textAlign: "left", fontSize: 14, cursor: "pointer", borderBottom: `1px solid ${BORDER}`, color: INK,
@@ -1498,16 +2211,33 @@ function CanvasScreen({ note, group, groups, onUpdateCards, onBack, materialBox,
       )}
 
       {/* カードエディタ(階層スタック: 子カードを開くと深くなる) */}
-      {editStack.map((id, i) => (
-        i === editStack.length - 1 ? (
+      {editStack.map((id, i) => {
+        if (i !== editStack.length - 1) return null;
+        // 最上位(depth1)のカードが連結チェーンの一部なら、左右スワイプで前後へ移動できる
+        let chainIds = null;
+        if (i === 0) {
+          const cur = cards.find((c) => c.id === id);
+          if (cur && !cur.parentId) {
+            // チェーンの先頭を探す
+            const incTop = buildIncoming(topLevel);
+            let head = id;
+            const guard = new Set();
+            while (incTop[head] && !guard.has(head)) { guard.add(head); head = incTop[head]; }
+            const ch = chainFrom(topLevel, head);
+            if (ch.length >= 2) chainIds = ch.map((c) => c.id);
+          }
+        }
+        return (
           <CardEditor key={id} cardId={id} cards={cards} depth={i + 1}
             patchCard={patchCard} addCards={addCards} removeDeep={removeDeep}
             detachChild={detachChild} onUndo={undo} onRedo={redo}
+            chainIds={chainIds}
+            onNavigate={(cid) => setEditStack((st) => [...st.slice(0, -1), cid])}
             pushEdit={(cid) => setEditStack((st) => [...st, cid])}
             onClose={() => setEditStack((st) => st.slice(0, -1))}
             showToast={showToast} />
-        ) : null
-      ))}
+        );
+      })}
 
       {/* チュートリアル */}
       <TutStyle />
@@ -1555,7 +2285,7 @@ function CanvasScreen({ note, group, groups, onUpdateCards, onBack, materialBox,
 }
 
 /* ============================================================
-   永続化(Googleログイン時=Firestore / ログインなし=localStorage)
+   永続化(localStorage)
    旧形式のデータは子カード形式に自動移行
    ============================================================ */
 const STORAGE_KEY = "teddynote:data";
@@ -1576,31 +2306,23 @@ const migrateAll = (data) => {
   return { v: 3, groups, materialBox };
 };
 const persistence = {
-  // Googleログイン中はFirestore、ログインなしの場合はlocalStorage
-  load: async (user) => {
+  load: async () => {
     try {
-      if (user) {
-        const d = await loadUserData(user.uid);
-        return d ? migrateAll(d) : null;
-      }
       const raw = localStorage.getItem(STORAGE_KEY);
       return raw ? migrateAll(JSON.parse(raw)) : null;
-    } catch (e) { console.error("load failed", e); return null; }
+    } catch (e) { return null; }
   },
-  save: async (user, groups, materialBox) => {
-    try {
-      const data = { v: 3, groups, materialBox };
-      if (user) await saveUserData(user.uid, data);
-      else localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-      return true;
-    } catch (e) { console.error("save failed", e); return false; }
+  save: async (groups, materialBox) => {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ v: 3, groups, materialBox })); return true; }
+    catch (e) { console.error("save failed", e); return false; }
   },
 };
 
 const DEFAULT_GROUPS = () => [
-  { id: uid(), name: "外国語", notes: [] },
-  { id: uid(), name: "趣味", notes: [] },
-  { id: uid(), name: "アルバム", notes: [] },
+  { id: uid(), name: "国語", notes: [] },
+  { id: uid(), name: "数学", notes: [] },
+  { id: uid(), name: "化学", notes: [] },
+  { id: uid(), name: "修学旅行のアルバム", notes: [] },
 ];
 
 /* ノートの中身を小さく描く(ホームのノートタイル用) */
@@ -1633,10 +2355,7 @@ function MiniPreview({ cards }) {
    ホーム画面(グループ=チップ / ノート=プレビュー付きグリッド)
    ============================================================ */
 export default function App() {
-  const [user, setUser] = useState(undefined); // undefined=確認中 / null=未ログイン
-  const [guest, setGuest] = useState(false);   // ログインなしで使用
-  const [authErr, setAuthErr] = useState("");
-  const entered = !!user || guest;
+  const [entered, setEntered] = useState(false);
   const [materialBox, setMaterialBox] = useState([]);
   const [groups, setGroups] = useState([]);
   const [loaded, setLoaded] = useState(false);
@@ -1657,9 +2376,6 @@ export default function App() {
     try { localStorage.setItem("teddynote:tut", "1"); } catch (e) {}
   };
 
-  // ログイン状態の監視
-  useEffect(() => watchAuth((u) => { setUser(u); if (u) setGuest(false); }), []);
-
   // 初回だけチュートリアルを自動開始
   useEffect(() => {
     try { if (localStorage.getItem("teddynote:tut")) tutSeen.current = true; } catch (e) {}
@@ -1672,12 +2388,8 @@ export default function App() {
   }, [entered, loaded]);
 
   useEffect(() => {
-    if (!entered) return;
-    let alive = true;
     (async () => {
-      setLoaded(false);
-      const data = await persistence.load(user);
-      if (!alive) return;
+      const data = await persistence.load();
       if (data) {
         const gs = Array.isArray(data.groups) ? data.groups : [];
         const untouched = gs.length > 0 && gs.every((g) => !g.notes || g.notes.length === 0);
@@ -1685,23 +2397,21 @@ export default function App() {
         setMaterialBox(Array.isArray(data.materialBox) ? data.materialBox : []);
       } else {
         setGroups(DEFAULT_GROUPS());
-        setMaterialBox([]);
       }
       setLoaded(true);
     })();
-    return () => { alive = false; };
-  }, [user, entered]);
+  }, []);
 
   useEffect(() => {
-    if (!loaded || !entered) return;
+    if (!loaded) return;
     setSaveState("saving");
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
-      const ok = await persistence.save(user, groups, materialBox);
+      const ok = await persistence.save(groups, materialBox);
       setSaveState(ok ? "saved" : "error");
     }, 800);
     return () => clearTimeout(saveTimer.current);
-  }, [groups, materialBox, loaded, entered, user]);
+  }, [groups, materialBox, loaded]);
 
   const group = groups.find((g) => g.id === (openNote ? openNote.groupId : selGroup));
   const note = openNote && group ? group.notes.find((n) => n.id === openNote.noteId) : null;
@@ -1727,22 +2437,7 @@ export default function App() {
     </div>
   );
 
-  if (user === undefined) {
-    return (
-      <div style={{ position: "fixed", inset: 0, background: "#f4f5f7", display: "flex", alignItems: "center", justifyContent: "center", color: SUBTLE, fontSize: 14 }}>
-        読み込み中…
-      </div>
-    );
-  }
-  if (!entered) {
-    return <LoginGate
-      onGuest={() => setGuest(true)}
-      onGoogle={async () => {
-        setAuthErr("");
-        try { await loginGoogle(); } catch (e) { setAuthErr(jpAuthError(e)); }
-      }}
-      err={authErr} />;
-  }
+  if (!entered) return <LoginGate onEnter={() => setEntered(true)} />;
 
   if (!loaded) {
     return (
@@ -1779,7 +2474,7 @@ export default function App() {
         {/* ブランド */}
         <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
           <img src={LOGO_SRC} alt="" style={{ width: 58, height: 58, objectFit: "contain", mixBlendMode: "multiply" }} />
-          <div style={{ marginTop: 8, fontSize: 25, color: "#23272d", fontFamily: SERIF, letterSpacing: "0.26em", textIndent: "0.26em" }}>teddy note</div>
+          <div style={{ marginTop: 8, fontSize: 25, color: "#23272d", fontFamily: SERIF, letterSpacing: "0.26em", textIndent: "0.26em" }}>onote</div>
           <div style={{ marginTop: 6, fontSize: 9.5, color: "#9aa1aa", letterSpacing: "0.3em", textIndent: "0.3em" }}>〜 CARDS ON MY CANVAS 〜</div>
         </div>
 
@@ -1881,21 +2576,12 @@ export default function App() {
         )}
 
         <div style={{ marginTop: 50, textAlign: "center", color: "#c3cad2", fontSize: 10, letterSpacing: 3, fontFamily: SERIF }}>
-          teddy note
+          onote
         </div>
         <div style={{ textAlign: "center", marginTop: 10 }}>
           <button onClick={() => setTut("rename")} style={{ border: "none", background: "none", color: SUBTLE, fontSize: 11, cursor: "pointer", letterSpacing: 1 }}>
             ？ 使い方をもう一度見る
           </button>
-        </div>
-        <div style={{ textAlign: "center", marginTop: 6 }}>
-          {user ? (
-            <button onClick={() => { setGuest(false); logout(); }} style={{ border: "none", background: "none", color: SUBTLE, fontSize: 11, cursor: "pointer", letterSpacing: 1 }}>
-              ↪ ログアウト({user.displayName || user.email})
-            </button>
-          ) : (
-            <span style={{ fontSize: 10, color: "#c3cad2", letterSpacing: 1 }}>ログインなしで利用中(データはこの端末のみ)</span>
-          )}
         </div>
       </div>
 
@@ -1940,9 +2626,10 @@ export default function App() {
 }
 
 /* ============================================================
-   ログイン画面 — Googleログイン / ログインなし利用
+   ログイン画面 — perl rabbit風ミニマルUI
    ============================================================ */
-function LoginGate({ onGuest, onGoogle, err }) {
+function LoginGate({ onEnter }) {
+  const [note, setNote] = useState("");
   return (
     <div style={{
       position: "fixed", inset: 0, overflow: "auto",
@@ -1951,12 +2638,12 @@ function LoginGate({ onGuest, onGoogle, err }) {
     }}>
       <div style={{ minHeight: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "48px 26px", boxSizing: "border-box" }}>
 
-        <img src={LOGO_SRC} alt="teddy note" style={{ width: 96, height: 96, objectFit: "contain", mixBlendMode: "multiply", marginTop: 18 }} />
+        <img src={LOGO_SRC} alt="onote" style={{ width: 96, height: 96, objectFit: "contain", mixBlendMode: "multiply", marginTop: 18 }} />
 
         <div style={{
-          marginTop: 22, fontSize: 38, color: "#23272d", fontFamily: SERIF, fontWeight: 500,
+          marginTop: 10, fontSize: 38, color: "#23272d", fontFamily: SERIF, fontWeight: 500,
           letterSpacing: "0.28em", textIndent: "0.28em",
-        }}>teddy note</div>
+        }}>onote</div>
 
         <div style={{
           marginTop: 14, fontSize: 12, color: "#8b939d", letterSpacing: "0.32em", textIndent: "0.32em",
@@ -1969,13 +2656,13 @@ function LoginGate({ onGuest, onGoogle, err }) {
 
         <div style={{ width: "min(560px, 92%)", height: 1, background: "#dcdfe3", margin: "44px 0 52px" }} />
 
-        <button onClick={onGuest} style={{
+        <button onClick={onEnter} style={{
           width: "min(560px, 100%)", padding: "19px 0", border: "none", borderRadius: 999,
           background: "#cfe0ee", color: "#3a4654", fontSize: 17, fontWeight: 700, letterSpacing: 2,
           cursor: "pointer",
         }}>＋ ログインなしで使用</button>
 
-        <button onClick={onGoogle} style={{
+        <button onClick={() => setNote("プレビュー版ではGoogleログインは使えません。Firebase版で利用できます。")} style={{
           width: "min(560px, 100%)", padding: "16px 0", borderRadius: 999, marginTop: 14,
           background: "rgba(255,255,255,0.85)", color: "#4a525c", fontSize: 14, fontWeight: 600, letterSpacing: 1,
           border: "1px solid #dcdfe3", cursor: "pointer", display: "flex",
@@ -1989,11 +2676,10 @@ function LoginGate({ onGuest, onGoogle, err }) {
           Googleでログイン
         </button>
 
-        {err && <div style={{ fontSize: 11, color: "#d04030", marginTop: 16, lineHeight: 1.7, textAlign: "center", maxWidth: 360 }}>{err}</div>}
+        {note && <div style={{ fontSize: 11, color: ACCENT_DEEP, marginTop: 16, lineHeight: 1.7, textAlign: "center" }}>{note}</div>}
 
-        <div style={{ fontSize: 12, color: "#9aa1aa", marginTop: 26, letterSpacing: 1, textAlign: "center", lineHeight: 1.9 }}>
-          Googleでログインすると、どの端末からでも同じノートを開けます。<br />
-          ログインなしの場合は、この端末の中だけに保存されます。
+        <div style={{ fontSize: 12, color: "#9aa1aa", marginTop: 26, letterSpacing: 1, textAlign: "center" }}>
+          すべて端末内だけで保存されます(どこにも送信されません)
         </div>
       </div>
     </div>
